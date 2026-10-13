@@ -20,19 +20,23 @@ static void SetFlagsINR(CPU8080 *cpu, uint8_t old_val, uint8_t new_val) {
 }
 
 static void SetFlagsDCR(CPU8080 *cpu, uint8_t old_val, uint8_t new_val) {
-    cpu->AC = ((old_val & 0x0F) == 0);
+    // DCR = сложение с 0xFF: перенос из бита 3 есть, если младшая тетрада не нулевая
+    cpu->AC = ((old_val & 0x0F) != 0);
     SetFlagsZSP(cpu, new_val);
 }
 
-static void SetFlagsAdd(CPU8080 *cpu, uint8_t r1, uint8_t r2, int res) {
+// cin - перенос на входе (0 для ADD/ADI, CY для ADC/ACI)
+static void SetFlagsAdd(CPU8080 *cpu, uint8_t r1, uint8_t r2, int cin, int res) {
     cpu->CY = (res > 0xFF);
-    cpu->AC = (((r1 & 0xF) + (r2 & 0xF)) > 0xF);
+    cpu->AC = (((r1 & 0xF) + (r2 & 0xF) + cin) > 0xF);
     SetFlagsZSP(cpu, (uint8_t)res);
 }
 
-static void SetFlagsSub(CPU8080 *cpu, uint8_t r1, uint8_t r2, int res) {
+// bin - заём на входе (0 для SUB/CMP/SUI/CPI, CY для SBB/SBI).
+// На 8080 вычитание = A + ~src + !bin, AC - перенос из бита 3 этого сложения.
+static void SetFlagsSub(CPU8080 *cpu, uint8_t r1, uint8_t r2, int bin, int res) {
     cpu->CY = (res < 0);
-    cpu->AC = (((r1 & 0xF) - (r2 & 0xF)) < 0);
+    cpu->AC = (((r1 & 0xF) + ((~r2) & 0xF) + (bin ? 0 : 1)) > 0xF);
     SetFlagsZSP(cpu, (uint8_t)res);
 }
 
@@ -76,12 +80,10 @@ static void SetReg(CPU8080 *cpu, int reg_idx, uint8_t val) {
 
 void cpu8080_reset(CPU8080 *cpu) {
     if (!cpu) return;
+    // Полный сброс состояния: регистры, флаги, ППА, таймер, отложенное прерывание
+    memset(cpu, 0, sizeof(*cpu));
     cpu->PC = 0xF800;
     cpu->SP = 0x0000;
-    cpu->A = cpu->B = cpu->C = cpu->D = cpu->E = cpu->H = cpu->L = 0;
-    cpu->S = cpu->Z = cpu->AC = cpu->P = cpu->CY = false;
-    cpu->EI = false;
-    cpu->halted = false;
 }
 
 int cpu8080_step(CPU8080 *cpu) {
@@ -100,13 +102,19 @@ int cpu8080_step(CPU8080 *cpu) {
         4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // B0-BF
         5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // C0-CF
         5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // D0-DF
-        5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // E0-EF
-        5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11  // F0-FF
+        5, 10, 10, 18, 11, 11, 7,  11, 5, 5,  10, 5,  11, 17, 7,  11, // E0-EF (E3 XTHL=18, E9 PCHL=5, EB XCHG=5)
+        5, 10, 10, 10, 11, 11, 7,  11, 5, 5,  10, 10, 11, 17, 7,  11  // F0-FF (F9 SPHL=5)
     };
 
+    // Приём аппаратного прерывания: RST 7 (вектор 0x0038), EI сбрасывается
     if (cpu->int_pending && cpu->EI) {
         cpu->int_pending = false;
+        cpu->EI = false;
         cpu->halted = false;
+        cpu8080_write(cpu, --cpu->SP, cpu->PC >> 8);
+        cpu8080_write(cpu, --cpu->SP, cpu->PC & 0xFF);
+        cpu->PC = 0x0038;
+        return 11;
     }
 
     if (cpu->halted) {
@@ -142,19 +150,19 @@ int cpu8080_step(CPU8080 *cpu) {
     case 0x31: { uint16_t l = cpu8080_read(cpu, cpu->PC++); uint16_t h = cpu8080_read(cpu, cpu->PC++); cpu->SP = (h << 8) | l; return cycles; }
 
     case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
-    case 0x86: case 0x87: { uint8_t src = GetReg(cpu, op & 7); int r = cpu->A + src; SetFlagsAdd(cpu, cpu->A, src, r); cpu->A = (uint8_t)r; return cycles; }
+    case 0x86: case 0x87: { uint8_t src = GetReg(cpu, op & 7); int r = cpu->A + src; SetFlagsAdd(cpu, cpu->A, src, 0, r); cpu->A = (uint8_t)r; return cycles; }
 
     case 0x88: case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D:
-    case 0x8E: case 0x8F: { uint8_t src = GetReg(cpu, op & 7); int r = cpu->A + src + (cpu->CY ? 1 : 0); SetFlagsAdd(cpu, cpu->A, src, r); cpu->A = (uint8_t)r; return cycles; }
+    case 0x8E: case 0x8F: { uint8_t src = GetReg(cpu, op & 7); int c = cpu->CY ? 1 : 0; int r = cpu->A + src + c; SetFlagsAdd(cpu, cpu->A, src, c, r); cpu->A = (uint8_t)r; return cycles; }
 
     case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95:
-    case 0x96: case 0x97: { uint8_t src = GetReg(cpu, op & 7); int r = cpu->A - src; SetFlagsSub(cpu, cpu->A, src, r); cpu->A = (uint8_t)r; return cycles; }
+    case 0x96: case 0x97: { uint8_t src = GetReg(cpu, op & 7); int r = cpu->A - src; SetFlagsSub(cpu, cpu->A, src, 0, r); cpu->A = (uint8_t)r; return cycles; }
 
     case 0x98: case 0x99: case 0x9A: case 0x9B: case 0x9C: case 0x9D:
-    case 0x9E: case 0x9F: { uint8_t src = GetReg(cpu, op & 7); int r = cpu->A - src - (cpu->CY ? 1 : 0); SetFlagsSub(cpu, cpu->A, src, r); cpu->A = (uint8_t)r; return cycles; }
+    case 0x9E: case 0x9F: { uint8_t src = GetReg(cpu, op & 7); int c = cpu->CY ? 1 : 0; int r = cpu->A - src - c; SetFlagsSub(cpu, cpu->A, src, c, r); cpu->A = (uint8_t)r; return cycles; }
 
     case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5:
-    case 0xA6: case 0xA7: { cpu->A &= GetReg(cpu, op & 7); cpu->CY = false; cpu->AC = true; SetFlagsZSP(cpu, cpu->A); return cycles; }
+    case 0xA6: case 0xA7: { uint8_t src = GetReg(cpu, op & 7); cpu->AC = ((cpu->A | src) & 0x08) != 0; cpu->A &= src; cpu->CY = false; SetFlagsZSP(cpu, cpu->A); return cycles; }
 
     case 0xA8: case 0xA9: case 0xAA: case 0xAB: case 0xAC: case 0xAD:
     case 0xAE: case 0xAF: { cpu->A ^= GetReg(cpu, op & 7); cpu->CY = false; cpu->AC = false; SetFlagsZSP(cpu, cpu->A); return cycles; }
@@ -163,20 +171,20 @@ int cpu8080_step(CPU8080 *cpu) {
     case 0xB6: case 0xB7: { cpu->A |= GetReg(cpu, op & 7); cpu->CY = false; cpu->AC = false; SetFlagsZSP(cpu, cpu->A); return cycles; }
 
     case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD:
-    case 0xBE: case 0xBF: { uint8_t src = GetReg(cpu, op & 7); int r = cpu->A - src; SetFlagsSub(cpu, cpu->A, src, r); return cycles; }
+    case 0xBE: case 0xBF: { uint8_t src = GetReg(cpu, op & 7); int r = cpu->A - src; SetFlagsSub(cpu, cpu->A, src, 0, r); return cycles; }
 
-    case 0xC6: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int r = cpu->A + imm; SetFlagsAdd(cpu, cpu->A, imm, r); cpu->A = (uint8_t)r; return cycles; }
-    case 0xCE: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int r = cpu->A + imm + (cpu->CY ? 1 : 0); SetFlagsAdd(cpu, cpu->A, imm, r); cpu->A = (uint8_t)r; return cycles; }
-    case 0xD6: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int r = cpu->A - imm; SetFlagsSub(cpu, cpu->A, imm, r); cpu->A = (uint8_t)r; return cycles; }
-    case 0xDE: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int r = cpu->A - imm - (cpu->CY ? 1 : 0); SetFlagsSub(cpu, cpu->A, imm, r); cpu->A = (uint8_t)r; return cycles; }
-    case 0xE6: { cpu->A &= cpu8080_read(cpu, cpu->PC++); cpu->CY = false; cpu->AC = true; SetFlagsZSP(cpu, cpu->A); return cycles; }
+    case 0xC6: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int r = cpu->A + imm; SetFlagsAdd(cpu, cpu->A, imm, 0, r); cpu->A = (uint8_t)r; return cycles; }
+    case 0xCE: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int c = cpu->CY ? 1 : 0; int r = cpu->A + imm + c; SetFlagsAdd(cpu, cpu->A, imm, c, r); cpu->A = (uint8_t)r; return cycles; }
+    case 0xD6: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int r = cpu->A - imm; SetFlagsSub(cpu, cpu->A, imm, 0, r); cpu->A = (uint8_t)r; return cycles; }
+    case 0xDE: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int c = cpu->CY ? 1 : 0; int r = cpu->A - imm - c; SetFlagsSub(cpu, cpu->A, imm, c, r); cpu->A = (uint8_t)r; return cycles; }
+    case 0xE6: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); cpu->AC = ((cpu->A | imm) & 0x08) != 0; cpu->A &= imm; cpu->CY = false; SetFlagsZSP(cpu, cpu->A); return cycles; }
     case 0xEE: { cpu->A ^= cpu8080_read(cpu, cpu->PC++); cpu->CY = false; cpu->AC = false; SetFlagsZSP(cpu, cpu->A); return cycles; }
     case 0xF6: { cpu->A |= cpu8080_read(cpu, cpu->PC++); cpu->CY = false; cpu->AC = false; SetFlagsZSP(cpu, cpu->A); return cycles; }
-    case 0xFE: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int r = cpu->A - imm; SetFlagsSub(cpu, cpu->A, imm, r); return cycles; }
+    case 0xFE: { uint8_t imm = cpu8080_read(cpu, cpu->PC++); int r = cpu->A - imm; SetFlagsSub(cpu, cpu->A, imm, 0, r); return cycles; }
 
-    case 0xC3: { uint16_t l = cpu8080_read(cpu, cpu->PC++); uint16_t h = cpu8080_read(cpu, cpu->PC++); cpu->PC = (h << 8) | l; return cycles; }
-    case 0xCD: { uint16_t l = cpu8080_read(cpu, cpu->PC++); uint16_t h = cpu8080_read(cpu, cpu->PC++); cpu8080_write(cpu, --cpu->SP, cpu->PC >> 8); cpu8080_write(cpu, --cpu->SP, cpu->PC & 0xFF); cpu->PC = (h << 8) | l; return cycles; }
-    case 0xC9: { uint16_t l = cpu8080_read(cpu, cpu->SP++); uint16_t h = cpu8080_read(cpu, cpu->SP++); cpu->PC = (h << 8) | l; return cycles; }
+    case 0xC3: case 0xCB: { uint16_t l = cpu8080_read(cpu, cpu->PC++); uint16_t h = cpu8080_read(cpu, cpu->PC++); cpu->PC = (h << 8) | l; return cycles; }
+    case 0xCD: case 0xDD: case 0xED: case 0xFD: { uint16_t l = cpu8080_read(cpu, cpu->PC++); uint16_t h = cpu8080_read(cpu, cpu->PC++); cpu8080_write(cpu, --cpu->SP, cpu->PC >> 8); cpu8080_write(cpu, --cpu->SP, cpu->PC & 0xFF); cpu->PC = (h << 8) | l; return cycles; }
+    case 0xC9: case 0xD9: { uint16_t l = cpu8080_read(cpu, cpu->SP++); uint16_t h = cpu8080_read(cpu, cpu->SP++); cpu->PC = (h << 8) | l; return cycles; }
 
     case 0xC0: if (!cpu->Z) { uint16_t l = cpu8080_read(cpu, cpu->SP++); uint16_t h = cpu8080_read(cpu, cpu->SP++); cpu->PC = (h << 8) | l; cycles = 11; } return cycles;
     case 0xC8: if (cpu->Z) { uint16_t l = cpu8080_read(cpu, cpu->SP++); uint16_t h = cpu8080_read(cpu, cpu->SP++); cpu->PC = (h << 8) | l; cycles = 11; } return cycles;

@@ -35,8 +35,6 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
     self.emulationLayer = [CALayer layer];
     self.emulationLayer.frame = self.view.bounds;
     self.emulationLayer.contentsGravity = kCAGravityResizeAspect;
-    // Разворачивает картинку по горизонтали и вертикали силами видеокарты
-    self.emulationLayer.transform = CATransform3DMakeScale(1.0, -1.0, 1.0);
     
     // Pixel-art фильтрация
     self.emulationLayer.magnificationFilter = kCAFilterNearest;
@@ -198,7 +196,7 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
         SCREEN_WIDTH, SCREEN_HEIGHT,
         8, 32, SCREEN_WIDTH * 4,
         colorSpace,
-        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big, // Оптимальный 32-битный формат
+        kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst,
         provider, NULL, NO, kCGRenderingIntentDefault
     );
     

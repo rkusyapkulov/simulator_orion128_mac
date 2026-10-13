@@ -7,12 +7,19 @@
 
 // --- СТРУКТУРЫ ТАЙМЕРА КР580ВИ53 ---
 typedef struct {
-    uint16_t count;
-    uint16_t latch;
-    uint8_t mode;
-    uint8_t bcd;
-    uint8_t access_phase;
+    uint16_t count;         // текущее значение (в BCD-режиме хранится как обычное число 0..9999)
+    uint16_t latch;         // защёлкнутое значение для чтения
+    uint16_t reload;        // значение перезагрузки (режимы 2 и 3)
+    uint8_t mode;           // режим 0..5
+    uint8_t bcd;            // 1 - двоично-десятичный счёт
+    uint8_t rw_mode;        // 1 - только LSB, 2 - только MSB, 3 - LSB затем MSB
+    uint8_t access_phase;   // фаза записи счётчика (LSB/MSB)
+    uint8_t read_phase;     // фаза чтения счётчика (LSB/MSB)
+    uint8_t wr_lo;          // принятый, но ещё не применённый младший байт
+    uint8_t state;          // служебное состояние (режим 4: 1 - строб выдан, 2 - завершён)
     bool latched;
+    bool armed;             // счётчик загружен и считает
+    bool out;               // выход OUT
     double phase;
 } PITChannel;
 

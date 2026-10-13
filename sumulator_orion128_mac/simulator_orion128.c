@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include "8080.h"
 #include "simulator_orion128.h"
 
@@ -22,25 +23,121 @@ bool rk_rus_lat_pressed;             // Модификатор РУС/ЛАТ -> 
 static uint8_t keyboard_matrix[8] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 // Эталонная 16-цветная палитра Ориона-128 (в формате ARGB/RGBA для Mac)
-// ИСПРАВЛЕННАЯ ПАЛИТРА: КРАСНЫЙ И СИНИЙ ПОМЕНЯНЫ МЕСТАМИ (ПОД ВАШ ТЕКУЩИЙ ВЫВОД)
 static const uint32_t orion_palette[16] = {
-    0xFF000000, // 0 - Черный
-    0xFFAA0000, // 1 - Синий (Байт AA перенесен в начало, где Mac видит Синий)
-    0xFF00AA00, // 2 - Зеленый
-    0xFFAAAA00, // 3 - Голубой (Cyan)
-    0xFF0000AA, // 4 - Красный (Байт AA перенесен в конец, где Mac видит Красный)
-    0xFFAA00AA, // 5 - Пурпурный
-    0xFF0055AA, // 6 - Коричневый
-    0xFFAAAAAA, // 7 - Серый
-    0xFF555555, // 8 - Темно-серый
-    0xFFFF5555, // 9 - Светло-синий
-    0xFF55FF55, // 10 - Светло-зеленый
-    0xFFFFFF55, // 11 - Светло-голубой
-    0xFF5555FF, // 12 - Светло-красный
-    0xFFFF55FF, // 13 - Светло-пурпурный
-    0xFF55FFFF, // 14 - Желтый
-    0xFFFFFFFF  // 15 - Белый
+    0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA, 0x00AA0000, 0x00AA00AA,
+    0x00AA5500, 0x00AAAAAA, 0x00555555, 0x005555FF, 0x0055FF55, 0x0055FFFF,
+    0x00FF5555, 0x00FF55FF, 0x00FFFF55, 0x00FFFFFF
 };
+
+#ifndef PIT_CLOCK_HZ
+#define PIT_CLOCK_HZ 2500000   // частота CLK таймера; подставьте значение из схемы вашего Ориона
+#endif
+
+static uint16_t pit_bcd2bin(uint16_t v) {
+    return (uint16_t)(((v >> 12) & 15) * 1000 + ((v >> 8) & 15) * 100 + ((v >> 4) & 15) * 10 + (v & 15));
+}
+static uint16_t pit_bin2bcd(uint16_t v) {
+    v %= 10000;
+    return (uint16_t)(((v / 1000) << 12) | (((v / 100) % 10) << 8) | (((v / 10) % 10) << 4) | (v % 10));
+}
+static uint16_t pit_norm(uint32_t v, int bcd) { return (uint16_t)(bcd ? v % 10000u : v & 0xFFFFu); }
+static uint16_t pit_dec(uint16_t c, int bcd) { return c == 0 ? (uint16_t)(bcd ? 9999 : 0xFFFF) : (uint16_t)(c - 1); }
+
+static void pit_load(PITChannel *ch, uint16_t raw) {
+    uint16_t v = ch->bcd ? pit_norm(pit_bcd2bin(raw), 1) : raw;
+    ch->reload = v;
+    switch (ch->mode) {
+    case 0: ch->count = v; ch->armed = true; ch->out = false; ch->state = 0; break;
+    case 4: ch->count = v; ch->armed = true; ch->out = true;  ch->state = 0; break;
+    case 2: case 3:
+        if (!ch->armed) {   // новый счёт подхватывается в конце периода, если счётчик уже идёт
+            ch->armed = true; ch->out = true;
+            ch->count = (ch->mode == 3) ? pit_norm((uint32_t)v + (v & 1), ch->bcd) : v;
+        }
+        break;
+    default: break;
+    }
+}
+
+static void pit_write_control(CPU8080 *cpu, uint8_t val) {
+    cpu->pit_control = val;
+    int sel = (val >> 6) & 3;
+    if (sel == 3) return;                       // у ВИ53 нет команды Read-Back
+    PITChannel *ch = &cpu->pit_channels[sel];
+    int rw = (val >> 4) & 3;
+    if (rw == 0) {                              // защёлкивание: режим и счёт не затрагиваются
+        if (!ch->latched) { ch->latch = ch->count; ch->latched = true; }
+        return;
+    }
+    int m = (val >> 1) & 7;
+    if (m >= 6) m -= 4;                         // режимы 6 и 7 - синонимы 2 и 3
+    ch->mode = (uint8_t)m;
+    ch->bcd = val & 1;
+    ch->rw_mode = (uint8_t)rw;
+    ch->access_phase = ch->read_phase = 0;
+    ch->latched = false; ch->armed = false; ch->state = 0;
+    ch->out = (m != 0);
+}
+
+static void pit_write_count(PITChannel *ch, uint8_t val) {
+    uint16_t v;
+    if (ch->rw_mode == 0) return;               // слово режима ещё не записано
+    if (ch->rw_mode == 1) v = val;
+    else if (ch->rw_mode == 2) v = (uint16_t)(val << 8);
+    else if (ch->access_phase == 0) {
+        ch->wr_lo = val; ch->access_phase = 1;
+        if (ch->mode == 0) { ch->armed = false; ch->out = false; }  // режим 0: счёт стоит до записи MSB
+        return;
+    } else {
+        v = (uint16_t)((val << 8) | ch->wr_lo); ch->access_phase = 0;
+    }
+    pit_load(ch, v);
+}
+
+static uint8_t pit_read_count(PITChannel *ch) {
+    uint16_t c = ch->latched ? ch->latch : ch->count;
+    if (ch->bcd) c = pit_bin2bcd(c);
+    uint8_t r;
+    if (ch->rw_mode == 2)      { r = (uint8_t)(c >> 8); ch->latched = false; }
+    else if (ch->rw_mode == 1) { r = (uint8_t)(c & 0xFF); ch->latched = false; }
+    else if (ch->read_phase == 0) { r = (uint8_t)(c & 0xFF); ch->read_phase = 1; }
+    else                       { r = (uint8_t)(c >> 8); ch->read_phase = 0; ch->latched = false; }
+    return r;
+}
+
+static void pit_tick_channel(PITChannel *ch, int n) {
+    for (; n > 0 && ch->armed; n--) {
+        switch (ch->mode) {
+        case 0:
+            ch->count = pit_dec(ch->count, ch->bcd);
+            if (ch->count == 0) ch->out = true;
+            break;
+        case 2:
+            ch->count = pit_dec(ch->count, ch->bcd);
+            if (ch->count == 1) ch->out = false;
+            else if (ch->count == 0) { ch->count = ch->reload; ch->out = true; }
+            break;
+        case 3:
+            ch->count = pit_dec(pit_dec(ch->count, ch->bcd), ch->bcd);
+            if (ch->count == 0) {
+                ch->out = !ch->out;
+                uint32_t r = ch->reload;
+                ch->count = pit_norm(ch->out ? r + (r & 1) : (r & ~1u), ch->bcd);
+            }
+            break;
+        case 4:
+            ch->count = pit_dec(ch->count, ch->bcd);
+            if (ch->state == 1) { ch->out = true; ch->state = 2; }
+            else if (ch->state == 0 && ch->count == 0) { ch->out = false; ch->state = 1; }
+            break;
+        default: return;
+        }
+    }
+}
+
+static void pit_tick(CPU8080 *cpu, int n) {
+    for (int i = 0; i < 3; i++) pit_tick_channel(&cpu->pit_channels[i], n);
+}
 
 // =========================================================================
 // ИСПРАВЛЕННЫЙ АППАРАТНЫЙ ДИСПЕТЧЕР ЧТЕНИЯ ПАМЯТИ И ПОРТОВ (ОРИОН-128)
@@ -58,7 +155,7 @@ uint8_t cpu8080_read(CPU8080 *cpu, uint16_t addr) {
     if ((current_bank == 0 || current_bank == 1) && addr >= 0xF400 && addr <= 0xF7FF) {
         
         // К580ВВ55 №1: Порт клавиатуры (0xF400 - 0xF403)
-        if (addr >= 0xF400 && addr <= 0xF403) {
+        if ((addr & 0xFF00) == 0xF400) {
             uint16_t reg = addr & 3;
             if (reg == 0) return cpu->ppi0_pa;
             if (reg == 1) {
@@ -88,7 +185,7 @@ uint8_t cpu8080_read(CPU8080 *cpu, uint16_t addr) {
         }
         
         // К580ВВ55 №2: Интерфейс ROM-диска (0xF500 - 0xF503)
-        if (addr >= 0xF500 && addr <= 0xF503) {
+        if ((addr & 0xFF00) == 0xF500) {
             uint16_t reg = addr & 3;
             if (reg == 0) {
                 uint16_t rom_address = (cpu->ppi1_pc << 8) | cpu->ppi1_pb;
@@ -100,7 +197,7 @@ uint8_t cpu8080_read(CPU8080 *cpu, uint16_t addr) {
         }
         
         // ППА №3: 0xF600–0xF603
-        if (addr >= 0xF600 && addr <= 0xF603) {
+        if ((addr & 0xFF00) == 0xF600) {
             switch (addr & 3) {
                 case 0: return cpu->ppi2_pa;
                 case 1: return cpu->ppi2_pb;
@@ -113,25 +210,12 @@ uint8_t cpu8080_read(CPU8080 *cpu, uint16_t addr) {
         if (addr >= 0xF730 && addr <= 0xF733) {
             uint16_t reg = addr & 3;
 
-            if (reg < 3) {
-                PITChannel *ch = &cpu->pit_channels[reg];
-                uint8_t value;
-                uint16_t count = ch->latched ? ch->latch : ch->count;
-
-                if (ch->access_phase == 0) {
-                    value = (uint8_t)(count & 0xFF);
-                    ch->access_phase = 1; // МЕНЯЕМ ФАЗУ НА СЛЕДУЮЩИЙ ШАГ
-                } else {
-                    value = (uint8_t)(count >> 8);
-                    ch->access_phase = 0;
-                    ch->latched = false;
-                }
-                return value;
-            }
+            if (reg < 3) return pit_read_count(&cpu->pit_channels[reg]);
 
             return cpu->pit_control;
         }
 
+        return 0xFF; // Неподключённый адрес окна ввода-вывода: шина "плавает"
     }
 
     // 3. Служебная область системных переменных Монитора (0xF000 - 0xF3FF)
@@ -162,7 +246,7 @@ void cpu8080_write(CPU8080 *cpu, uint16_t addr, uint8_t val) {
 
     // 2. Запись в периферийные БИС К580ВВ55 и КР580ВИ53 (0xF400 - 0xF7FF)
     if ((current_bank == 0 || current_bank == 1) && addr >= 0xF400 && addr <= 0xF7FF) {
-        if (addr <= 0xF403) {
+        if ((addr & 0xFF00) == 0xF400) {
             uint16_t reg = addr & 3;
             if (reg == 0) cpu->ppi0_pa = val;
             else if (reg == 1) cpu->ppi0_pb = val;
@@ -179,7 +263,7 @@ void cpu8080_write(CPU8080 *cpu, uint16_t addr, uint8_t val) {
             }
             return;
         }
-        if (addr >= 0xF500 && addr <= 0xF503) {
+        if ((addr & 0xFF00) == 0xF500) {
             uint16_t reg = addr & 3;
             if (reg == 0) cpu->ppi1_pa = val;
             else if (reg == 1) cpu->ppi1_pb = val;
@@ -187,7 +271,7 @@ void cpu8080_write(CPU8080 *cpu, uint16_t addr, uint8_t val) {
             else cpu->ppi1_ctrl = val;
             return;
         }
-        if (addr >= 0xF600 && addr <= 0xF603) {
+        if ((addr & 0xFF00) == 0xF600) {
             uint16_t reg = addr & 3;
             if (reg == 0) { cpu->ppi2_pa = val; }
             else if (reg == 1) { cpu->ppi2_pb = val; }
@@ -198,31 +282,8 @@ void cpu8080_write(CPU8080 *cpu, uint16_t addr, uint8_t val) {
         // Системный таймер КР580ВИ53 (PIT)
         if (addr >= 0xF730 && addr <= 0xF733) {
             uint16_t reg = addr & 3;
-            if (reg < 3) {
-                PITChannel *ch = &cpu->pit_channels[reg]; // Исправлено на указатель C
-                if (ch->access_phase == 0) {
-                    ch->count = (ch->count & 0xFF00) | val;
-                    ch->access_phase = 1;
-                }
-                else {
-                    ch->count = (ch->count & 0x00FF) | (val << 8);
-                    ch->access_phase = 0;
-                }
-            }
-            else {
-                cpu->pit_control = val;
-                int sel_ch = (val >> 6) & 3;
-                if (sel_ch < 3) {
-                    cpu->pit_channels[sel_ch].mode = (val >> 1) & 7;
-                    cpu->pit_channels[sel_ch].bcd = val & 1;
-                    cpu->pit_channels[sel_ch].access_phase = 0;
-                    int rw_mode = (val >> 4) & 3;
-                    if (rw_mode == 0) {
-                        cpu->pit_channels[sel_ch].latch = cpu->pit_channels[sel_ch].count;
-                        cpu->pit_channels[sel_ch].latched = true;
-                    }
-                }
-            }
+            if (reg < 3) pit_write_count(&cpu->pit_channels[reg], val);
+            else pit_write_control(cpu, val);
             return;
         }
         return;
@@ -239,17 +300,17 @@ void cpu8080_write(CPU8080 *cpu, uint16_t addr, uint8_t val) {
 // Аудио-подсистема
 #define AUDIO_RING_SIZE 16384
 static int16_t audio_ring_buffer[AUDIO_RING_SIZE];
-static volatile uint32_t audio_ring_head = 0;
-static volatile uint32_t audio_ring_tail = 0;
+static _Atomic uint32_t audio_ring_head = 0;   // пишет только основной поток
+static _Atomic uint32_t audio_ring_tail = 0;   // пишет только аудиопоток
 static uint8_t current_speaker_bit = 0;
 
 void audio_ring_push(int16_t sample) {
-    uint32_t head = audio_ring_head;
+    uint32_t head = atomic_load_explicit(&audio_ring_head, memory_order_relaxed);
     uint32_t next_head = (head + 1u) % AUDIO_RING_SIZE;
-    uint32_t tail = audio_ring_tail;
+    uint32_t tail = atomic_load_explicit(&audio_ring_tail, memory_order_acquire);
     if (next_head != tail) {
         audio_ring_buffer[head] = sample;
-        audio_ring_head = next_head;
+        atomic_store_explicit(&audio_ring_head, next_head, memory_order_release);
     }
 }
 
@@ -259,11 +320,11 @@ static CPU8080 global_cpu;
 void orion128_get_audio_samples(int16_t *buffer, int sample_count) {
     if (!buffer || sample_count <= 0) return;
     for (int i = 0; i < sample_count; i++) {
-        uint32_t tail = audio_ring_tail;
-        uint32_t head = audio_ring_head;
+        uint32_t tail = atomic_load_explicit(&audio_ring_tail, memory_order_relaxed);
+        uint32_t head = atomic_load_explicit(&audio_ring_head, memory_order_acquire);
         if (tail != head) {
             buffer[i] = audio_ring_buffer[tail];
-            audio_ring_tail = (tail + 1u) % AUDIO_RING_SIZE;
+            atomic_store_explicit(&audio_ring_tail, (tail + 1u) % AUDIO_RING_SIZE, memory_order_release);
         } else {
             // ИСПРАВЛЕНО: Заполняем актуальным уровнем постоянного тока из структуры CPU
             buffer[i] = global_cpu.EI ? 4000 : -4000;
@@ -275,6 +336,7 @@ void orion128_get_audio_samples(int16_t *buffer, int sample_count) {
 #define AUDIO_SAMPLE_RATE 44100
 
 static uint64_t audio_sample_phase = 0;
+static uint64_t pit_accum = 0;   // дробный остаток тактов CLK таймера
 
 void orion128_execute_cycles(int cycles)
 {
@@ -288,6 +350,13 @@ void orion128_execute_cycles(int cycles)
         }
 
         executed += step_cycles;
+
+        pit_accum += (uint64_t)step_cycles * PIT_CLOCK_HZ;
+        if (pit_accum >= CPU_CLOCK_HZ) {
+            int ticks = (int)(pit_accum / CPU_CLOCK_HZ);
+            pit_accum %= CPU_CLOCK_HZ;
+            pit_tick(&global_cpu, ticks);
+        }
 
         audio_sample_phase +=
             (uint64_t)step_cycles * AUDIO_SAMPLE_RATE;
@@ -328,18 +397,17 @@ void RenderOrionScreen(void) {
     for (int x_byte = 0; x_byte < 48; x_byte++) {
         for (int y = 0; y < 256; y++) {
             uint16_t addr = screen_base + (x_byte * 256) + y;
-            int pixel_y = (256 - 1) - y; // Переворачиваем по вертикали, если нужно для Mac
             
             uint8_t layer0 = orion_ram[bank_mask][addr];
 
             if (!color_mode) {
                 // Монохромный режим
-                uint32_t color_on = (palette_idx == 0) ? 0xFF00FF00 : 0xFFFFFF00; // Зеленый или Желтый
-                uint32_t color_off = 0xFF000000; // Черный
+                uint32_t color_on = (palette_idx == 0) ? 0x0000FF00 : 0x0000FFFF; // Зеленый или Желтый (порядок байт как в orion_palette)
+                uint32_t color_off = 0x00000000; // Черный
                 
                 for (int bit = 0; bit < 8; bit++) {
                     bool dot_state = (layer0 & (1 << (7 - bit))) != 0;
-                    int dest_idx = (pixel_y * SCREEN_WIDTH) + (x_byte * 8) + bit;
+                    int dest_idx = (y * SCREEN_WIDTH) + (x_byte * 8) + bit;
                     pixel_buffer[dest_idx] = dot_state ? color_on : color_off;
                 }
             } else {
@@ -362,7 +430,7 @@ void RenderOrionScreen(void) {
                             static const uint8_t pal2[] = { 0, 5, 3, 15 };
                             final_idx = pal2[color_code];
                         }
-                        int dest_idx = (pixel_y * SCREEN_WIDTH) + (x_byte * 8) + bit;
+                        int dest_idx = (y * SCREEN_WIDTH) + (x_byte * 8) + bit;
                         pixel_buffer[dest_idx] = orion_palette[final_idx & 0x0F];
                     }
                 } else {
@@ -373,7 +441,7 @@ void RenderOrionScreen(void) {
                     for (int bit = 0; bit < 8; bit++) {
                         bool bit0 = (layer0 & (1 << (7 - bit))) != 0;
                         uint8_t final_idx = bit0 ? fg_idx : bg_idx;
-                        int dest_idx = (pixel_y * SCREEN_WIDTH) + (x_byte * 8) + bit;
+                        int dest_idx = (y * SCREEN_WIDTH) + (x_byte * 8) + bit;
                         pixel_buffer[dest_idx] = orion_palette[final_idx];
                     }
                 }
@@ -404,9 +472,11 @@ void orion128_init(const char *monitor_path, const char *romdisk_path) {
 void orion128_reset(void) {
     current_speaker_bit = 0;
 
-    audio_ring_head = 0;
-    audio_ring_tail = 0;
+    // Очередь сбрасывает только производитель: head := tail (tail принадлежит аудиопотоку)
+    atomic_store_explicit(&audio_ring_head,
+        atomic_load_explicit(&audio_ring_tail, memory_order_acquire), memory_order_release);
     audio_sample_phase = 0;
+    pit_accum = 0;
 
     orion_page = 0;
     orion_sys_port1 = 0;
@@ -481,6 +551,11 @@ bool orion128_load_file(const char* filepath, char* out_msg, size_t msg_max_len)
     fseek(file, 0, SEEK_END);
     long file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
+    if (file_size <= 0) {
+        fclose(file);
+        if (out_msg) snprintf(out_msg, msg_max_len, "Ошибка: файл пуст или его размер не определён.");
+        return false;
+    }
 
     // Извлекаем расширение файла вручную (в нижнем регистре)
     char ext[8] = { 0 };
@@ -518,11 +593,15 @@ bool orion128_load_file(const char* filepath, char* out_msg, size_t msg_max_len)
         orion_sys_port3 = 0;   // Видеовыход строго на стандартный адрес 0xC000
 
         global_cpu.EI = false;        // Выключаем прерывания
+        global_cpu.halted = false;    // Выходим из HLT, иначе программа не стартует
+        global_cpu.int_pending = false;
         global_cpu.PC = load_address; // Устанавливаем точку старта процессора (0x0000)
-        global_cpu.SP = 0xEFFF;       // Выделяем стек в безопасной верхней зоне ОЗУ
+        global_cpu.SP = 0xBFFF;       // Стек ниже экранной памяти (C000-EFFF), чтобы не портить картинку
 
-        // Системная интеграция: заполняем ОЗУ под нужды Монитора/ORDOS базовыми заглушками
-        orion_ram[0][0xBE03] = 0xC9; // Заглушка под ORDOS (команда RET)
+        // Заглушка под ORDOS (RET) - только если она не затирает данные самой программы
+        if (file_length <= 0xBE03) {
+            orion_ram[0][0xBE03] = 0xC9;
+        }
         for (int o_addr = 0xF000; o_addr < 0xF800; o_addr++) {
             orion_ram[0][o_addr] = 0x00; // Очищаем буфер системных переменных (NOP)
         }

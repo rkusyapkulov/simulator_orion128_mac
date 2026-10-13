@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #define SCREEN_WIDTH  384
 #define SCREEN_HEIGHT 256
