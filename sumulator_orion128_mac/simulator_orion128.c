@@ -110,7 +110,7 @@ static void pit_tick_channel(PITChannel *ch, int n) {
         switch (ch->mode) {
         case 0:
             ch->count = pit_dec(ch->count, ch->bcd);
-            if (ch->count == 0) ch->out = true;
+            if (ch->count == 0) ch->out = true;   // после терминального счёта счётчик продолжает считать
             break;
         case 2:
             ch->count = pit_dec(ch->count, ch->bcd);
@@ -317,6 +317,9 @@ void audio_ring_push(int16_t sample) {
 // Экземпляр процессора КР580ВМ80А внутри симулятора
 static CPU8080 global_cpu;
 
+// Аудиопоток только читает готовые сэмплы. Сэмплы (бипер INTE + каналы ВИ53) формирует
+// поток эмуляции в orion128_execute_cycles: раньше канал ВИ53 микшировался здесь, и на весь
+// буфер из 1024 сэмплов брался один и тот же out, то есть тон превращался в постоянный уровень.
 void orion128_get_audio_samples(int16_t *buffer, int sample_count) {
     if (!buffer || sample_count <= 0) return;
     for (int i = 0; i < sample_count; i++) {
@@ -326,14 +329,31 @@ void orion128_get_audio_samples(int16_t *buffer, int sample_count) {
             buffer[i] = audio_ring_buffer[tail];
             atomic_store_explicit(&audio_ring_tail, (tail + 1u) % AUDIO_RING_SIZE, memory_order_release);
         } else {
-            // ИСПРАВЛЕНО: Заполняем актуальным уровнем постоянного тока из структуры CPU
-            buffer[i] = global_cpu.EI ? 4000 : -4000;
+            buffer[i] = global_cpu.EI ? 4000 : -4000;   // очередь пуста: удерживаем текущий уровень
         }
     }
 }
 
 #define CPU_CLOCK_HZ 2500000
 #define AUDIO_SAMPLE_RATE 44100
+
+// Один сэмпл: бипер INTE + меандры каналов ВИ53 (режимы 2 и 3), среднее двух источников
+static int16_t mix_audio_sample(const CPU8080 *cpu) {
+    int16_t sample = cpu->EI ? 4000 : -4000;
+    int active = 0, mixed = 0;
+    for (int ch = 0; ch < 3; ch++) {
+        const PITChannel *c = &cpu->pit_channels[ch];
+        if (c->armed && (c->mode == 2 || c->mode == 3) && c->reload > 3) {
+            mixed += c->out ? 1 : -1;
+            active++;
+        }
+    }
+    if (active > 0) {
+        int vi53 = mixed * 5000 / active;
+        sample = (int16_t)((vi53 + sample) / 2);
+    }
+    return sample;
+}
 
 static uint64_t audio_sample_phase = 0;
 static uint64_t pit_accum = 0;   // дробный остаток тактов CLK таймера
@@ -364,8 +384,7 @@ void orion128_execute_cycles(int cycles)
         while (audio_sample_phase >= CPU_CLOCK_HZ) {
             audio_sample_phase -= CPU_CLOCK_HZ;
 
-            int16_t sample = global_cpu.EI ? 4000 : -4000;
-            audio_ring_push(sample);
+            audio_ring_push(mix_audio_sample(&global_cpu));
         }
     }
 }
@@ -402,7 +421,7 @@ void RenderOrionScreen(void) {
 
             if (!color_mode) {
                 // Монохромный режим
-                uint32_t color_on = (palette_idx == 0) ? 0x0000FF00 : 0x0000FFFF; // Зеленый или Желтый (порядок байт как в orion_palette)
+                uint32_t color_on = (palette_idx == 0) ? 0x0000FF00 : 0x00FFFF00; // Зеленый или Желтый (формат пикселя 0x00RRGGBB)
                 uint32_t color_off = 0x00000000; // Черный
                 
                 for (int bit = 0; bit < 8; bit++) {

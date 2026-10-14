@@ -19,8 +19,8 @@ static void SetFlagsINR(CPU8080 *cpu, uint8_t old_val, uint8_t new_val) {
     SetFlagsZSP(cpu, new_val);
 }
 
-static void SetFlagsDCR(CPU8080 *cpu, uint8_t old_val, uint8_t new_val) {
-    // DCR = сложение с 0xFF: перенос из бита 3 есть, если младшая тетрада не нулевая
+static void SetFlagsDCR(CPU8080* cpu, uint8_t old_val, uint8_t new_val) {
+    // DCR = сложение с 0xFF: перенос из бита 3 есть, если младшая тетрада не нулевая.
     cpu->AC = ((old_val & 0x0F) != 0);
     SetFlagsZSP(cpu, new_val);
 }
@@ -34,9 +34,19 @@ static void SetFlagsAdd(CPU8080 *cpu, uint8_t r1, uint8_t r2, int cin, int res) 
 
 // bin - заём на входе (0 для SUB/CMP/SUI/CPI, CY для SBB/SBI).
 // На 8080 вычитание = A + ~src + !bin, AC - перенос из бита 3 этого сложения.
-static void SetFlagsSub(CPU8080 *cpu, uint8_t r1, uint8_t r2, int bin, int res) {
+static void SetFlagsSub(CPU8080* cpu,
+    uint8_t r1,
+    uint8_t r2,
+    int bin,
+    int res)
+{
+    // CY — заём из старшего разряда.
     cpu->CY = (res < 0);
-    cpu->AC = (((r1 & 0xF) + ((~r2) & 0xF) + (bin ? 0 : 1)) > 0xF);
+
+    // На 8080 вычитание = A + ~operand + !borrow, а AC - перенос из бита 3 этого СЛОЖЕНИЯ
+    // (то есть AC = "нет заёма", а не "заём").
+    cpu->AC = (((r1 & 0x0F) + ((~r2) & 0x0F) + (bin ? 0 : 1)) > 0x0F);
+
     SetFlagsZSP(cpu, (uint8_t)res);
 }
 
@@ -77,13 +87,50 @@ static void SetReg(CPU8080 *cpu, int reg_idx, uint8_t val) {
 }
 
 // --- ИНИЦИАЛИЗАЦИЯ И СБРОС (RESET) ---
-
-void cpu8080_reset(CPU8080 *cpu) {
+void cpu8080_reset(CPU8080* cpu)
+{
     if (!cpu) return;
-    // Полный сброс состояния: регистры, флаги, ППА, таймер, отложенное прерывание
+
     memset(cpu, 0, sizeof(*cpu));
+
     cpu->PC = 0xF800;
     cpu->SP = 0x0000;
+
+    // Состояние ППА, использовавшееся в старом эмуляторе.
+    cpu->ppi0_pa = cpu->ppi0_pb = cpu->ppi0_pc = 0xFF;
+    cpu->ppi0_ctrl = 0x9B;
+
+    cpu->ppi1_pa = cpu->ppi1_pb = cpu->ppi1_pc = 0xFF;
+    cpu->ppi1_ctrl = 0x9B;
+
+    cpu->ppi2_pa = cpu->ppi2_pb = cpu->ppi2_pc = 0xFF;
+    cpu->ppi2_ctrl = 0x9B;
+
+    // Первый кадровый интервал — 50 000 тактов при 2,5 МГц и 50 Гц.
+    cpu->cycles_until_interrupt = 50000;
+    cpu->int_pending = false;
+
+    cpu->EI = false;
+    cpu->halted = false;
+
+    cpu->pit_control = 0;
+
+    for (int i = 0; i < 3; ++i) {
+        cpu->pit_channels[i].count = 0;
+        cpu->pit_channels[i].latch = 0;
+        cpu->pit_channels[i].reload = 0;
+        cpu->pit_channels[i].mode = 0;
+        cpu->pit_channels[i].bcd = 0;
+        cpu->pit_channels[i].rw_mode = 0;
+        cpu->pit_channels[i].access_phase = 0;
+        cpu->pit_channels[i].read_phase = 0;
+        cpu->pit_channels[i].wr_lo = 0;
+        cpu->pit_channels[i].state = 0;
+        cpu->pit_channels[i].latched = false;
+        cpu->pit_channels[i].armed = false;
+        cpu->pit_channels[i].out = false;
+        cpu->pit_channels[i].phase = 0.0;
+    }
 }
 
 int cpu8080_step(CPU8080 *cpu) {

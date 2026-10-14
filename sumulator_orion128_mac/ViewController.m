@@ -12,9 +12,33 @@ extern bool rk_cc_pressed;                  // Модификатор CC (Shift)
 extern bool rk_us_pressed;                  // Модификатор УС (Ctrl) -> PC6
 extern bool rk_rus_lat_pressed;
 
+// Время удержания РУС/ЛАТ: монитор опрашивает клавиатуру раз в несколько кадров
+#define RUS_LAT_HOLD_SECONDS 0.1
+
+// stringWithUTF8String: возвращает nil на невалидном UTF-8 (например, имя файла ORDOS в КОИ-8),
+// а NSAlert не принимает nil. Битые байты заменяем на '?'.
+static NSString *SafeUTF8String(const char *msg) {
+    NSString *s = [NSString stringWithUTF8String:msg];
+    if (s) return s;
+    size_t n = strlen(msg);
+    NSMutableData *out = [NSMutableData dataWithCapacity:n];
+    for (size_t i = 0; i < n; ) {
+        unsigned char c = (unsigned char)msg[i];
+        size_t len = c < 0x80 ? 1 : (c >= 0xC2 && c <= 0xDF) ? 2 : (c >= 0xE0 && c <= 0xEF) ? 3 : (c >= 0xF0 && c <= 0xF4) ? 4 : 0;
+        BOOL ok = len > 0 && i + len <= n;
+        for (size_t k = 1; ok && k < len; k++) ok = (((unsigned char)msg[i + k]) & 0xC0) == 0x80;
+        if (ok) { [out appendBytes:msg + i length:len]; i += len; }
+        else    { [out appendBytes:"?" length:1]; i++; }
+    }
+    s = [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding];
+    return s ?: @"(сообщение недоступно)";
+}
+
 @interface ViewController () {
     AudioQueueRef audioQueue;
     AudioQueueBufferRef audioBuffers[2];
+    NSUInteger _rusLatToken;   // поколение нажатия РУС/ЛАТ: устаревшие отложенные отпускания игнорируются
+    BOOL _lastCapsLock;        // предыдущее состояние Caps Lock
 }
 @end
 
@@ -29,6 +53,8 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    
+    _lastCapsLock = ([NSEvent modifierFlags] & NSEventModifierFlagCapsLock) != 0;
     
     // Инициализация слоя рендеринга CoreAnimation
     self.view.wantsLayer = YES;
@@ -161,11 +187,17 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
 - (void)startEmulation {
     [self stopEmulation];
     // Интервал 0.02 секунды соответствует кадровой частоте развертки 50 Гц
-    self.emulationTimer = [NSTimer scheduledTimerWithTimeInterval:0.02
-                                                           target:self
-                                                         selector:@selector(emulationLoop)
-                                                         userInfo:nil
-                                                          repeats:YES];
+    // Блочный таймер со слабой ссылкой: NSTimer с target:self удерживал бы контроллер,
+    // и dealloc (а с ним остановка таймера и аудио) никогда бы не вызвался
+    __weak typeof(self) weakSelf = self;
+    self.emulationTimer = [NSTimer timerWithTimeInterval:0.02 repeats:YES block:^(NSTimer *timer) {
+        ViewController *strongSelf = weakSelf;
+        if (!strongSelf) {
+            [timer invalidate];
+            return;
+        }
+        [strongSelf emulationLoop];
+    }];
     [[NSRunLoop currentRunLoop] addTimer:self.emulationTimer forMode:NSRunLoopCommonModes];
 }
 
@@ -201,7 +233,11 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
     );
     
     if (imageRef) {
+        // У отдельного CALayer смена contents по умолчанию анимируется (кроссфейд) - отключаем
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
         self.emulationLayer.contents = (__bridge id _Nullable)(imageRef);
+        [CATransaction commit];
         CGImageRelease(imageRef);
     }
     
@@ -213,10 +249,15 @@ static void AudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueB
 // Оригинальная матрица Радио-86РК / Орион-128
 // Индексы соответствуют кнопкам виртуальной клавиатуры проекта
 static const int rk_hardware_map[] = {
+    // 0 - 14
     3 * 8 + 3, 2 * 8 + 1, 2 * 8 + 2, 2 * 8 + 3, 2 * 8 + 4, 2 * 8 + 5, 2 * 8 + 6, 2 * 8 + 7, 3 * 8 + 0, 3 * 8 + 1, 2 * 8 + 0, 3 * 8 + 5, 1 * 8 + 0, 1 * 8 + 1, 0,
+    // 15 - 29
     5 * 8 + 2, 4 * 8 + 3, 6 * 8 + 5, 5 * 8 + 3, 4 * 8 + 5, 5 * 8 + 6, 4 * 8 + 7, 7 * 8 + 3, 7 * 8 + 5, 7 * 8 + 2, 5 * 8 + 0, 3 * 8 + 2, 1 * 8 + 2, 0, 0,
+    // 30 - 44
     0, 4 * 8 + 6, 7 * 8 + 1, 6 * 8 + 7, 4 * 8 + 1, 6 * 8 + 0, 6 * 8 + 2, 5 * 8 + 7, 5 * 8 + 4, 4 * 8 + 4, 6 * 8 + 6, 7 * 8 + 4, 3 * 8 + 6, 1 * 8 + 3, 0,
+    // 45 - 59
     0, 6 * 8 + 1, 7 * 8 + 6, 6 * 8 + 3, 5 * 8 + 5, 5 * 8 + 1, 6 * 8 + 4, 7 * 8 + 0, 4 * 8 + 2, 4 * 8 + 0, 3 * 8 + 4, 3 * 8 + 7, 0, 7 * 8 + 7, 7 * 8 + 7,
+    // 60 - 71 (Добавленный функциональный блок, стрелки и СТР)
     0 * 8 + 0, 0 * 8 + 3, 0 * 8 + 1, 1 * 8 + 4, 1 * 8 + 5, 1 * 8 + 6, 0 * 8 + 4, 0 * 8 + 5, 0 * 8 + 6, 1 * 8 + 7, 0 * 8 + 2, 0
 };
 
@@ -331,12 +372,22 @@ static BOOL MapMacKeyToRK(unsigned short keyCode, int *out_row, int *out_col) {
     rk_cc_pressed = (modifierFlags & NSEventModifierFlagShift) != 0;
     rk_us_pressed = (modifierFlags & NSEventModifierFlagControl) != 0;
     
-    // ИСПРАВЛЕНИЕ: Кнопка считается нажатой ТОЛЬКО в момент изменения состояния фиксатора Caps Lock
-    static BOOL lastCapsLock = NO;
+    // РУС/ЛАТ нажимается при каждой смене фиксатора Caps Lock и удерживается фиксированное время.
+    // Раньше флаг висел до следующего события клавиатуры, а то и бесконечно.
     BOOL currentCapsLock = (modifierFlags & NSEventModifierFlagCapsLock) != 0;
-    
-    rk_rus_lat_pressed = (currentCapsLock != lastCapsLock);
-    lastCapsLock = currentCapsLock;
+    if (currentCapsLock != _lastCapsLock) {
+        _lastCapsLock = currentCapsLock;
+        rk_rus_lat_pressed = YES;
+        NSUInteger token = ++_rusLatToken;
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(RUS_LAT_HOLD_SECONDS * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            ViewController *strongSelf = weakSelf;
+            if (strongSelf && strongSelf->_rusLatToken == token) {
+                rk_rus_lat_pressed = NO;
+            }
+        });
+    }
     
     [super flagsChanged:event];
 }
@@ -347,10 +398,6 @@ static BOOL MapMacKeyToRK(unsigned short keyCode, int *out_row, int *out_col) {
     if (![event isARepeat]) {
         [self handleKeyEvent:event isPressed:YES];
     }
-    
-    // Как только нажата любая обычная клавиша — гарантированно отпускаем РУС/ЛАТ
-    extern bool rk_rus_lat_pressed;
-    rk_rus_lat_pressed = NO;
 }
 
 - (void)keyUp:(NSEvent *)event {
@@ -428,7 +475,7 @@ static BOOL MapMacKeyToRK(unsigned short keyCode, int *out_row, int *out_col) {
                     [alert setMessageText:@"Ошибка загрузки"];
                     [alert setAlertStyle:NSAlertStyleWarning];
                 }
-                [alert setInformativeText:[NSString stringWithUTF8String:msgBuffer]];
+                [alert setInformativeText:SafeUTF8String(msgBuffer)];
                 [alert runModal];
                 
                 // 4. Перезапускаем эмуляцию (процессор начнет выполнять код с нового PC)
