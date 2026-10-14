@@ -11,12 +11,12 @@
             shouldBeEnabled = "No"
             ignoreCount = "0"
             continueAfterRunningActions = "No"
-            filePath = "sumulator_orion128_mac/simulator_orion128.c"
+            filePath = "simulator_orion128_mac/simulator_orion128.c"
             startingColumnNumber = "9223372036854775807"
             endingColumnNumber = "9223372036854775807"
-            startingLineNumber = "390"
-            endingLineNumber = "390"
-            landmarkName = "orion128_init(monitor_path, romdisk_path)"
+            startingLineNumber = "376"
+            endingLineNumber = "376"
+            landmarkName = "orion128_execute_cycles(cycles)"
             landmarkType = "9">
          </BreakpointContent>
       </BreakpointProxy>
@@ -27,12 +27,12 @@
             shouldBeEnabled = "No"
             ignoreCount = "0"
             continueAfterRunningActions = "No"
-            filePath = "sumulator_orion128_mac/simulator_orion128.c"
+            filePath = "simulator_orion128_mac/simulator_orion128.c"
             startingColumnNumber = "9223372036854775807"
             endingColumnNumber = "9223372036854775807"
-            startingLineNumber = "429"
-            endingLineNumber = "429"
-            landmarkName = "orion128_run_frame()"
+            startingLineNumber = "414"
+            endingLineNumber = "414"
+            landmarkName = "RenderOrionScreen()"
             landmarkType = "9">
          </BreakpointContent>
       </BreakpointProxy>
@@ -43,12 +43,12 @@
             shouldBeEnabled = "No"
             ignoreCount = "0"
             continueAfterRunningActions = "No"
-            filePath = "sumulator_orion128_mac/simulator_orion128.c"
+            filePath = "simulator_orion128_mac/simulator_orion128.c"
             startingColumnNumber = "9223372036854775807"
             endingColumnNumber = "9223372036854775807"
-            startingLineNumber = "424"
-            endingLineNumber = "424"
-            landmarkName = "orion128_reset()"
+            startingLineNumber = "409"
+            endingLineNumber = "409"
+            landmarkName = "RenderOrionScreen()"
             landmarkType = "9">
          </BreakpointContent>
       </BreakpointProxy>
@@ -59,12 +59,12 @@
             shouldBeEnabled = "No"
             ignoreCount = "0"
             continueAfterRunningActions = "No"
-            filePath = "sumulator_orion128_mac/simulator_orion128.c"
+            filePath = "simulator_orion128_mac/simulator_orion128.c"
             startingColumnNumber = "9223372036854775807"
             endingColumnNumber = "9223372036854775807"
-            startingLineNumber = "423"
-            endingLineNumber = "423"
-            landmarkName = "orion128_reset()"
+            startingLineNumber = "408"
+            endingLineNumber = "408"
+            landmarkName = "RenderOrionScreen()"
             landmarkType = "9">
          </BreakpointContent>
       </BreakpointProxy>
